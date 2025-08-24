@@ -27,3 +27,4 @@ examples/welbe.json
 ddl/*
 terraform/repomix-output.xml
 repomix-output.xml
+.DS_Store

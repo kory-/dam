@@ -47,13 +47,17 @@ gcloud services enable dataflow.googleapis.com
 gcloud services enable bigquery.googleapis.com
 ```
 
-### 2. BQML モデルの作成
+### 2. BQML モデルの作成と管理
 
+#### 初回モデル作成
 bot_modelは事前に学習が必要です。以下のクエリを実行してモデルを作成：
 
 ```sql
 CREATE OR REPLACE MODEL `YOUR_PROJECT.YOUR_DATASET.bot_model`
-OPTIONS(model_type = 'AUTOENCODER')
+OPTIONS(
+  model_type = 'AUTOENCODER',
+  auto_class_weights = TRUE
+)
 AS
 SELECT
     req_total,
@@ -62,7 +66,41 @@ SELECT
     max_rps,
     ua_entropy
 FROM `YOUR_PROJECT.YOUR_DATASET.ip_features`
-WHERE log_date BETWEEN 'START_DATE' AND 'END_DATE';  -- 学習用データ期間
+WHERE log_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY) 
+  AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- 過去30日間のデータで学習
+```
+
+#### モデルの再訓練（推奨: 月次）
+定期的にモデルを再訓練することで、最新のトラフィックパターンに対応：
+
+```sql
+-- 既存モデルを置き換える場合
+CREATE OR REPLACE MODEL `YOUR_PROJECT.YOUR_DATASET.bot_model`
+OPTIONS(
+  model_type = 'AUTOENCODER',
+  auto_class_weights = TRUE
+)
+AS
+SELECT
+    req_total,
+    unique_uri,
+    err_ratio,
+    max_rps,
+    ua_entropy
+FROM `YOUR_PROJECT.YOUR_DATASET.ip_features`
+WHERE log_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY);
+```
+
+#### モデル評価
+訓練後、モデルの性能を確認：
+
+```sql
+-- モデルの評価メトリクスを確認
+SELECT * FROM ML.EVALUATE(
+  MODEL `YOUR_PROJECT.YOUR_DATASET.bot_model`,
+  TABLE `YOUR_PROJECT.YOUR_DATASET.ip_features`
+  WHERE log_date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+);
 ```
 
 ### 3. 変換スクリプトのアップロード
@@ -101,7 +139,7 @@ terraform apply
    - Dataflow ジョブを起動（前日分のログを取り込み）
    - ジョブ完了を待機
    - IP特徴量を更新（MERGE）
-   - BQML で推論実行
+   - BQML で異常検知実行（ML.DETECT）
    - 結果を bot_ips に保存
 
 ### テーブル構造

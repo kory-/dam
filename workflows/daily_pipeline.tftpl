@@ -1,0 +1,454 @@
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          # ==== Terraform から注入される定数（templatefile が展開）====
+          - project_id: "${project_id}"
+          - region: "${region}"
+          - dataset_id: "${dataset_id}"
+          - gcs_logs_bucket: "${gcs_logs_bucket}"
+          - dataform_repository: "${dataform_repository}"
+          - dataform_workspace: "${dataform_workspace}"
+
+          # ==== 実行日算出（target_date 指定なければ前日） ====
+          - has_target_date: '$${"target_date" in args}'
+          - current_time: '$${sys.now()}'
+          - today_date: '$${text.split(time.format(current_time), "T")[0]}'
+          - today_timestamp: '$${time.parse(today_date + "T00:00:00Z")}'
+          - yesterday_timestamp: '$${today_timestamp - 86400}'
+          - default_yesterday: '$${text.substring(time.format(yesterday_timestamp), 0, 10)}'
+          - processing_date: '$${if(has_target_date, args.target_date, default_yesterday)}'
+          - dataflow_job_name: '$${"cf-logs-import-" + text.replace_all(processing_date, "-", "")}'
+          - dataflow_sa: '$${"dam-dataflow-sa@" + project_id + ".iam.gserviceaccount.com"}'
+
+    # ===================== Dataflow 起動（リトライ） =====================
+    - init_dataflow_retry:
+        assign:
+          - zones: ["a","b","c"]
+          - machine_types: ["e2-standard-2","n1-standard-2","e2-medium"]
+          - dataflow_job_id: ""
+
+    - launch_dataflow_loop:
+        for:
+          value: retry_attempt
+          in: [0,1,2]
+          steps:
+            - select_zone_and_machine:
+                assign:
+                  - current_zone: '$${region + "-" + zones[retry_attempt % len(zones)]}'
+                  - current_machine_type: '$${machine_types[retry_attempt % len(machine_types)]}'
+
+            - log_attempt:
+                call: sys.log
+                args:
+                  severity: "INFO"
+                  text: '$${"Attempting Dataflow launch - Attempt " + string(retry_attempt + 1) + " - Zone: " + current_zone + " - Machine: " + current_machine_type}'
+
+            - launch_dataflow:
+                try:
+                  steps:
+                    - call_dataflow_api:
+                        call: http.post
+                        args:
+                          url: '$${"https://dataflow.googleapis.com/v1b3/projects/" + project_id + "/locations/" + region + "/templates:launch"}'
+                          query:
+                            gcsPath: '$${"gs://dataflow-templates-" + region + "/latest/GCS_Text_to_BigQuery"}'
+                          auth: { type: OAuth2 }
+                          body:
+                            jobName: '$${dataflow_job_name + "-" + string(retry_attempt)}'
+                            parameters:
+                              inputFilePattern: '$${"gs://" + gcs_logs_bucket + "/E3BQ0QYMSZ3FJA." + processing_date + "-*.gz"}'
+                              outputTable: "${project_id}:${dataset_id}.cf_logs_staging"
+                              javascriptTextTransformGcsPath: "gs://dam-dataflow-temp/scripts/transform.js"
+                              javascriptTextTransformFunctionName: "transform"
+                              bigQueryLoadingTemporaryDirectory: '$${"gs://dam-dataflow-temp/temp/" + processing_date}'
+                              JSONPath: "gs://dam-dataflow-temp/schemas/cf_logs_schema.json"
+                            environment:
+                              serviceAccountEmail: '$${dataflow_sa}'
+                              maxWorkers: 10
+                              numWorkers: 2
+                              zone: '$${current_zone}'
+                              tempLocation: '$${"gs://dam-dataflow-temp/temp/" + processing_date}'
+                              machineType: '$${current_machine_type}'
+                        result: dataflow_response
+
+                    - set_job_id:
+                        assign:
+                          - dataflow_job_id: '$${dataflow_response.body.job.id}'
+
+                    - wait_initial:
+                        call: sys.sleep
+                        args: { seconds: 60 }
+
+                    - check_job_initial_status:
+                        call: http.get
+                        args:
+                          url: '$${"https://dataflow.googleapis.com/v1b3/projects/" + project_id + "/locations/" + region + "/jobs/" + dataflow_job_id}'
+                          auth: { type: OAuth2 }
+                        result: job_check
+
+                    - evaluate_status:
+                        switch:
+                          - condition: '$${job_check.body.currentState == "JOB_STATE_RUNNING"}'
+                            assign:
+                              - launch_success: true
+                            next: break
+                          - condition: '$${job_check.body.currentState == "JOB_STATE_PENDING"}'
+                            steps:
+                              - wait_for_workers:
+                                  call: sys.sleep
+                                  args: { seconds: 60 }
+                              - recheck_status:
+                                  call: http.get
+                                  args:
+                                    url: '$${"https://dataflow.googleapis.com/v1b3/projects/" + project_id + "/locations/" + region + "/jobs/" + dataflow_job_id}'
+                                    auth: { type: OAuth2 }
+                                  result: job_recheck
+                              - final_evaluate:
+                                  switch:
+                                    - condition: '$${job_recheck.body.currentState == "JOB_STATE_RUNNING"}'
+                                      assign:
+                                        - launch_success: true
+                                      next: break
+                                    - condition: '$${job_recheck.body.currentState == "JOB_STATE_FAILED" and retry_attempt < 2}'
+                                      next: continue
+                                    - condition: '$${job_recheck.body.currentState == "JOB_STATE_FAILED"}'
+                                      raise:
+                                        message: '$${"All Dataflow launch attempts failed. Last status: " + job_recheck.body.currentState}'
+                          - condition: '$${job_check.body.currentState == "JOB_STATE_FAILED" and retry_attempt < 2}'
+                            next: continue
+                          - condition: '$${job_check.body.currentState == "JOB_STATE_FAILED"}'
+                            raise:
+                              message: '$${"All Dataflow launch attempts failed. Last status: " + job_check.body.currentState}'
+
+                except:
+                  as: e
+                  steps:
+                    - log_error:
+                        call: sys.log
+                        args:
+                          severity: "WARNING"
+                          text: '$${"Dataflow launch attempt " + string(retry_attempt + 1) + " failed"}'
+                    - check_if_last_attempt:
+                        switch:
+                          - condition: '$${retry_attempt >= 2}'
+                            raise: '$${e}'
+
+    - check_launch_success:
+        switch:
+          - condition: '$${dataflow_job_id == ""}'
+            raise:
+              message: "Failed to launch Dataflow job after all retries"
+
+    - log_success:
+        call: sys.log
+        args:
+          severity: "INFO"
+          text: '$${"Dataflow job launched successfully with ID: " + dataflow_job_id}'
+
+    # ===================== Dataflow 完了待ち =====================
+    - wait_for_dataflow:
+        call: wait_for_job_completion
+        args:
+          project_id: '$${project_id}'
+          region: '$${region}'
+          job_id: '$${dataflow_job_id}'
+        result: job_status
+
+    - check_dataflow_status:
+        switch:
+          - condition: '$${job_status != "JOB_STATE_DONE"}'
+            raise:
+              message: '$${"Dataflow job failed with status: " + job_status}'
+
+    # ===================== ステージング -> 本番（対象日だけ、重複排除） =====================
+    - merge_cf_logs_from_staging:
+        call: googleapis.bigquery.v2.jobs.insert
+        args:
+          projectId: '$${project_id}'
+          body:
+            jobReference:
+              location: '$${region}'
+            configuration:
+              query:
+                useLegacySql: false
+                priority: "INTERACTIVE"
+                parameterMode: "NAMED"
+                queryParameters:
+                  - name: proc_date
+                    parameterType: { type: "DATE" }
+                    parameterValue: { value: '$${processing_date}' }
+                query: |
+                  BEGIN TRANSACTION;
+                  
+                  DELETE FROM `${project_id}.${dataset_id}.cf_logs`
+                  WHERE DATE(date) = @proc_date;
+                  
+                  INSERT INTO `${project_id}.${dataset_id}.cf_logs`
+                  WITH base AS (
+                    SELECT *
+                    FROM `${project_id}.${dataset_id}.cf_logs_staging`
+                    WHERE DATE(date) = @proc_date
+                  ),
+                  keyed AS (
+                    SELECT
+                      *,
+                      COALESCE(
+                        x_edge_request_id,
+                        TO_HEX(SHA256(
+                          CAST(ARRAY_TO_STRING([
+                            CAST(date AS STRING),
+                            IFNULL(CAST(time AS STRING), ''),
+                            IFNULL(c_ip,''),
+                            IFNULL(cs_method,''),
+                            IFNULL(cs_host,''),
+                            IFNULL(cs_uri_stem,''),
+                            IFNULL(CAST(sc_status AS STRING), ''),
+                            IFNULL(cs_user_agent,'')
+                          ], '|') AS BYTES)
+                        ))
+                      ) AS _dedup_key
+                    FROM base
+                  ),
+                  ranked AS (
+                    SELECT
+                      keyed.*,
+                      ROW_NUMBER() OVER (PARTITION BY _dedup_key ORDER BY IFNULL(time, TIME '00:00:00'), x_edge_request_id) AS rn
+                    FROM keyed
+                  ),
+                  deduped AS (
+                    SELECT * FROM ranked WHERE rn = 1
+                  )
+                  SELECT * EXCEPT(_dedup_key, rn) FROM deduped;
+                  
+                  COMMIT TRANSACTION;
+        result: merge_job
+
+    - wait_for_merge_job:
+        call: wait_for_bq_job
+        args:
+          project_id: '$${project_id}'
+          job_id: '$${merge_job.jobReference.jobId}'
+          location: '$${merge_job.jobReference.location}'
+
+    # ステージングの対象日だけクリーンアップ
+    - cleanup_staging_for_day:
+        call: googleapis.bigquery.v2.jobs.insert
+        args:
+          projectId: '$${project_id}'
+          body:
+            jobReference:
+              location: '$${region}'
+            configuration:
+              query:
+                useLegacySql: false
+                priority: "INTERACTIVE"
+                parameterMode: "NAMED"
+                queryParameters:
+                  - name: proc_date
+                    parameterType: { type: "DATE" }
+                    parameterValue: { value: '$${processing_date}' }
+                query: |
+                  DELETE FROM `${project_id}.${dataset_id}.cf_logs_staging`
+                  WHERE DATE(date) = @proc_date;
+        result: cleanup_job
+
+    - wait_for_cleanup:
+        call: wait_for_bq_job
+        args:
+          project_id: '$${project_id}'
+          job_id: '$${cleanup_job.jobReference.jobId}'
+          location: '$${cleanup_job.jobReference.location}'
+
+    # ===================== Dataform実行 =====================
+    - compile_dataform:
+        call: http.post
+        args:
+          url: '$${"https://dataform.googleapis.com/v1beta1/projects/" + project_id + "/locations/" + region + "/repositories/" + dataform_repository + "/compilationResults"}'
+          auth: { type: OAuth2 }
+          body:
+            workspace: '$${"projects/" + project_id + "/locations/" + region + "/repositories/" + dataform_repository + "/workspaces/" + dataform_workspace}'
+        result: dataform_compilation
+
+    - wait_for_compilation:
+        call: sys.sleep
+        args: { seconds: 10 }
+
+    - invoke_dataform:
+        call: http.post
+        args:
+          url: '$${"https://dataform.googleapis.com/v1beta1/projects/" + project_id + "/locations/" + region + "/repositories/" + dataform_repository + "/workflowInvocations"}'
+          auth: { type: OAuth2 }
+          body:
+            compilationResult: '$${dataform_compilation.body.name}'
+            invocationConfig:
+              includedTargets:
+                - database: '$${project_id}'
+                  schema: "dam_workflow_test"
+                  name: "ip_features"
+                - database: '$${project_id}'
+                  schema: "dam_workflow_test"
+                  name: "bot_ips"
+                - database: '$${project_id}'
+                  schema: "dam_workflow_test"
+                  name: "cf_logs_filtered"
+                - database: '$${project_id}'
+                  schema: "dam_workflow_test"
+                  name: "logs_enriched"
+              transitiveDependenciesIncluded: true
+              fullyRefreshIncrementalTablesEnabled: false
+        result: dataform_invocation
+
+    - wait_for_dataform:
+        call: wait_for_dataform_completion
+        args:
+          invocation_name: '$${dataform_invocation.body.name}'
+        result: dataform_status
+
+    - check_dataform_status:
+        switch:
+          - condition: '$${dataform_status.state != "SUCCEEDED"}'
+            raise:
+              message: '$${"Dataform execution failed with state: " + dataform_status.state}'
+
+    - return_success:
+        return:
+          status: "SUCCESS"
+          message: '$${"Successfully processed data for " + processing_date}'
+          dataflow_job_id: '$${dataflow_job_id}'
+          dataform_invocation_id: '$${dataform_invocation.body.name}'
+
+# =============== サブフロー：Dataflow 完了待ち ===============
+wait_for_job_completion:
+  params: [project_id, region, job_id]
+  steps:
+    - init_polling:
+        assign:
+          - max_retries: 120
+          - retry_count: 0
+
+    - check_job:
+        try:
+          steps:
+            - get_job_status:
+                call: http.get
+                args:
+                  url: '$${"https://dataflow.googleapis.com/v1b3/projects/" + project_id + "/locations/" + region + "/jobs/" + job_id}'
+                  auth: { type: OAuth2 }
+                result: job_response
+            - check_status:
+                switch:
+                  - condition: '$${job_response.body.currentState == "JOB_STATE_DONE"}'
+                    return: "JOB_STATE_DONE"
+                  - condition: '$${job_response.body.currentState == "JOB_STATE_FAILED"}'
+                    return: "JOB_STATE_FAILED"
+                  - condition: '$${job_response.body.currentState == "JOB_STATE_CANCELLED"}'
+                    return: "JOB_STATE_CANCELLED"
+                  - condition: '$${retry_count >= max_retries}'
+                    return: "JOB_STATE_TIMEOUT"
+            - wait_and_retry:
+                call: sys.sleep
+                args: { seconds: 60 }
+            - increment_retry:
+                assign:
+                  - retry_count: '$${retry_count + 1}'
+                next: check_job
+        except:
+          as: e
+          steps:
+            - log_error:
+                call: sys.log
+                args:
+                  severity: "ERROR"
+                  data: '$${e}'
+            - return_error:
+                return: "JOB_STATE_ERROR"
+
+# =============== サブフロー：Dataform 完了待ち ===============
+wait_for_dataform_completion:
+  params: [invocation_name]
+  steps:
+    - init:
+        assign:
+          - max_retries: 180  # 30 minutes
+          - retry_count: 0
+    
+    - check_invocation:
+        try:
+          steps:
+            - get_status:
+                call: http.get
+                args:
+                  url: '$${"https://dataform.googleapis.com/v1beta1/" + invocation_name}'
+                  auth: { type: OAuth2 }
+                result: invocation_response
+            
+            - check_state:
+                switch:
+                  - condition: '$${invocation_response.body.state == "SUCCEEDED"}'
+                    return: '$${invocation_response.body}'
+                  - condition: '$${invocation_response.body.state == "FAILED"}'
+                    return: '$${invocation_response.body}'
+                  - condition: '$${invocation_response.body.state == "CANCELLED"}'
+                    return: '$${invocation_response.body}'
+                  - condition: '$${retry_count >= max_retries}'
+                    raise:
+                      message: "Dataform invocation timeout"
+            
+            - wait_and_retry:
+                call: sys.sleep
+                args: { seconds: 10 }
+            
+            - increment_retry:
+                assign:
+                  - retry_count: '$${retry_count + 1}'
+                next: check_invocation
+        except:
+          as: e
+          raise: '$${e}'
+
+# =============== サブフロー：BigQuery ジョブ待ち ===============
+wait_for_bq_job:
+  params: [project_id, job_id, location]
+  steps:
+    - init:
+        assign:
+          - max_retries: 60
+          - retry_count: 0
+    - check_job:
+        try:
+          steps:
+            - get_job:
+                call: googleapis.bigquery.v2.jobs.get
+                args:
+                  projectId: '$${project_id}'
+                  jobId: '$${job_id}'
+                  location: '$${location}'
+                result: job_result
+            - check_status:
+                switch:
+                  - condition: '$${job_result.status.state == "DONE"}'
+                    steps:
+                      - check_errors:
+                          switch:
+                            - condition: '$${"errorResult" in job_result.status}'
+                              raise:
+                                message: '$${job_result.status.errorResult.message}'
+                      - return_success:
+                          return: "SUCCESS"
+            - wait_and_retry:
+                call: sys.sleep
+                args: { seconds: 10 }
+            - increment_retry:
+                assign:
+                  - retry_count: '$${retry_count + 1}'
+            - check_timeout:
+                switch:
+                  - condition: '$${retry_count >= max_retries}'
+                    raise:
+                      message: "BigQuery job timeout"
+                next: check_job
+        except:
+          as: e
+          raise: '$${e}'

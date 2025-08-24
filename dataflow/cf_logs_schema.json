@@ -1,0 +1,169 @@
+{
+  "BigQuery Schema": [
+    {
+      "name": "date",
+      "type": "DATE",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "time",
+      "type": "TIME",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "x_edge_location",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "sc_bytes",
+      "type": "INTEGER",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "c_ip",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "cs_method",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "cs_host",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "cs_uri_stem",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "sc_status",
+      "type": "INTEGER",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "cs_referer",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "cs_user_agent",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "cs_uri_query",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "cs_cookie",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "x_edge_result_type",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "x_edge_request_id",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "x_host_header",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "cs_protocol",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "cs_bytes",
+      "type": "INTEGER",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "time_taken",
+      "type": "FLOAT",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "x_forwarded_for",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "ssl_protocol",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "ssl_cipher",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "x_edge_response_result_type",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "cs_protocol_version",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "fle_status",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "fle_encrypted_fields",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "c_port",
+      "type": "INTEGER",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "time_to_first_byte",
+      "type": "FLOAT",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "x_edge_detailed_result_type",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "sc_content_type",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "sc_content_len",
+      "type": "INTEGER",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "sc_range_start",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    },
+    {
+      "name": "sc_range_end",
+      "type": "STRING",
+      "mode": "NULLABLE"
+    }
+  ]
+}

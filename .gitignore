@@ -1,0 +1,29 @@
+.idea
+
+# Terraform state files
+*.tfstate
+*.tfstate.*
+
+# Terraform local configuration directory
+.terraform/
+
+# Terraform variable definition files
+*.tfvars
+*.tfvars.json
+
+# Terraform CLI configuration files
+.terraformrc
+terraform.rc
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Optional: Terraform lock file (uncomment to ignore)
+# .terraform.lock.hcl
+*.pem
+examples/welbe.json
+
+ddl/*
+terraform/repomix-output.xml
+repomix-output.xml

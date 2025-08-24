@@ -1,0 +1,36 @@
+# =====================================================
+# DAM Pipeline Terraform Configuration Example
+# =====================================================
+# Copy this file to terraform.tfvars and update values
+
+# GCP Configuration
+project_id              = "your-project-id"
+region                  = "asia-northeast1"
+zone                    = "asia-northeast1-a"
+
+# BigQuery Configuration
+dataset_id              = "dam_workflow"
+
+# GCS Configuration
+gcs_logs_bucket         = "your-cloudfront-logs-bucket"
+dataflow_temp_location  = "gs://your-dataflow-temp/temp"
+dataflow_staging_location = "gs://your-dataflow-temp/staging"
+
+# Scheduler Configuration
+scheduler_timezone      = "Asia/Tokyo"
+scheduler_cron          = "0 4 * * *"  # 4:00 JST daily
+
+# Notification Configuration (optional)
+notification_email      = ""
+
+# =====================================================
+# Dataform GitHub Integration
+# =====================================================
+# GitHub repository URL for Dataform (separate repository)
+# Example: https://github.com/your-username/dam-dataform.git
+dataform_git_repo_url   = ""
+
+# GitHub personal access token
+# Generate at: https://github.com/settings/tokens
+# Required scopes: repo (full control of private repositories)
+github_token            = ""

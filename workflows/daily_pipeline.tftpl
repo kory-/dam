@@ -26,7 +26,7 @@ main:
     - init_dataflow_retry:
         assign:
           - zones: ["a","b","c"]
-          - machine_types: ["e2-standard-2","n1-standard-2","e2-medium"]
+          - machine_types:  ["e2-medium","n1-standard-1","e2-small"]
           - dataflow_job_id: ""
 
     - launch_dataflow_loop:
@@ -66,7 +66,7 @@ main:
                               JSONPath: "gs://dam-dataflow-temp/schemas/cf_logs_schema.json"
                             environment:
                               serviceAccountEmail: '$${dataflow_sa}'
-                              maxWorkers: 10
+                              maxWorkers: 5
                               numWorkers: 2
                               zone: '$${current_zone}'
                               tempLocation: '$${"gs://dam-dataflow-temp/temp/" + processing_date}'

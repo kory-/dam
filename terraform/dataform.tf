@@ -116,3 +116,16 @@ resource "google_secret_manager_secret_iam_member" "dataform_secret_access" {
 data "google_project" "project" {
   project_id = var.project_id
 }
+
+# Dataformサービスエージェントがdam-dataform-saをimpersonateできるように権限付与
+resource "google_service_account_iam_member" "dataform_agent_token_creator" {
+  service_account_id = google_service_account.dataform_sa.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-dataform.iam.gserviceaccount.com"
+}
+
+resource "google_service_account_iam_member" "dataform_agent_user" {
+  service_account_id = google_service_account.dataform_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-dataform.iam.gserviceaccount.com"
+}

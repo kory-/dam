@@ -44,7 +44,7 @@ resource "google_bigquery_table" "ip_features" {
   schema = file("${path.module}/../ddl/ip_features.json")
 }
 
-# bot_ips table (for storing prediction results)
+# bot_ips table (for storing prediction results) - no partitioning/clustering for simplicity
 resource "google_bigquery_table" "bot_ips" {
   dataset_id          = google_bigquery_dataset.dam_dataset.dataset_id
   table_id            = "bot_ips"

@@ -376,14 +376,13 @@ main:
                   name: "ip_features"
                 - database: '$${project_id}'
                   schema: "dam_workflow_test"
+                  name: "bot_ips"
+                - database: '$${project_id}'
+                  schema: "dam_workflow_test"
                   name: "cf_logs_filtered"
-                # bot_ipsとlogs_enrichedは一時的に除外（bot_modelが作成されるまで）
-                # - database: '$${project_id}'
-                #   schema: "dam_workflow_test"
-                #   name: "bot_ips"
-                # - database: '$${project_id}'
-                #   schema: "dam_workflow_test"
-                #   name: "logs_enriched"
+                - database: '$${project_id}'
+                  schema: "dam_workflow_test"
+                  name: "logs_enriched"
               transitiveDependenciesIncluded: true
               fullyRefreshIncrementalTablesEnabled: false
         result: dataform_invocation

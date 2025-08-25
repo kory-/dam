@@ -18,7 +18,7 @@ main:
           - today_timestamp: '$${time.parse(today_date + "T00:00:00Z")}'
           - yesterday_timestamp: '$${today_timestamp - 86400}'
           - default_yesterday: '$${text.substring(time.format(yesterday_timestamp), 0, 10)}'
-          - processing_date: '$${if(has_target_date, args.target_date, default_yesterday)}'
+          - processing_date: '$${if(has_target_date, map.get(args, "target_date"), default_yesterday)}'
           - dataflow_job_name: '$${"cf-logs-import-" + text.replace_all(processing_date, "-", "")}'
           - dataflow_sa: '$${"dam-dataflow-sa@" + project_id + ".iam.gserviceaccount.com"}'
 

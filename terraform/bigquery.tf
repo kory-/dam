@@ -24,6 +24,15 @@ resource "google_bigquery_table" "cf_logs" {
   deletion_protection = false
   
   schema = file("${path.module}/../ddl/cf_logs.json")
+
+  # 日付パーティション（date列がDATE型）
+  time_partitioning {
+    type  = "DAY"
+    field = "date"
+  }
+
+  # よく使うキーでクラスタリング（検索/重複排除コスト削減）
+  clustering = ["c_ip", "cs_uri_stem", "x_edge_request_id"]
 }
 
 # ip_features table (for storing aggregated features)
@@ -81,6 +90,10 @@ resource "google_bigquery_table" "cf_logs_filtered" {
     SQL
     use_legacy_sql = false
   }
+
+  depends_on = [
+    google_bigquery_table.cf_logs
+  ]
 }
 
 # logs_enriched view

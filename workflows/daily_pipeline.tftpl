@@ -180,49 +180,136 @@ main:
                     parameterType: { type: "DATE" }
                     parameterValue: { value: '$${processing_date}' }
                 query: |
-                  BEGIN TRANSACTION;
-                  
-                  DELETE FROM `${project_id}.${dataset_id}.cf_logs`
-                  WHERE DATE(date) = @proc_date;
-                  
-                  INSERT INTO `${project_id}.${dataset_id}.cf_logs`
-                  WITH base AS (
-                    SELECT *
-                    FROM `${project_id}.${dataset_id}.cf_logs_staging`
-                    WHERE DATE(date) = @proc_date
-                  ),
-                  keyed AS (
-                    SELECT
-                      *,
-                      COALESCE(
-                        x_edge_request_id,
-                        TO_HEX(SHA256(
-                          CAST(ARRAY_TO_STRING([
-                            CAST(date AS STRING),
-                            IFNULL(CAST(time AS STRING), ''),
-                            IFNULL(c_ip,''),
-                            IFNULL(cs_method,''),
-                            IFNULL(cs_host,''),
-                            IFNULL(cs_uri_stem,''),
-                            IFNULL(CAST(sc_status AS STRING), ''),
-                            IFNULL(cs_user_agent,'')
-                          ], '|') AS BYTES)
-                        ))
-                      ) AS _dedup_key
-                    FROM base
-                  ),
-                  ranked AS (
-                    SELECT
-                      keyed.*,
-                      ROW_NUMBER() OVER (PARTITION BY _dedup_key ORDER BY IFNULL(time, TIME '00:00:00'), x_edge_request_id) AS rn
-                    FROM keyed
-                  ),
-                  deduped AS (
-                    SELECT * FROM ranked WHERE rn = 1
-                  )
-                  SELECT * EXCEPT(_dedup_key, rn) FROM deduped;
-                  
-                  COMMIT TRANSACTION;
+                  -- MERGE文で効率的にアップサート（パーティション指定付き）
+                  MERGE `${project_id}.${dataset_id}.cf_logs` AS target
+                  USING (
+                    -- ステージングデータから重複を排除
+                    WITH staged_data AS (
+                      SELECT *
+                      FROM `${project_id}.${dataset_id}.cf_logs_staging`
+                      WHERE DATE(date) = @proc_date
+                    ),
+                    -- 重複排除キー生成（改善版）
+                    keyed_data AS (
+                      SELECT
+                        *,
+                        -- x_edge_request_idを優先、なければ複合キーを生成
+                        COALESCE(
+                          x_edge_request_id,
+                          -- より安定したハッシュキー生成
+                          TO_HEX(SHA256(
+                            CONCAT(
+                              CAST(date AS STRING), '|',
+                              IFNULL(CAST(time AS STRING), '00:00:00'), '|',
+                              IFNULL(c_ip, ''), '|',
+                              IFNULL(cs_method, ''), '|',
+                              IFNULL(cs_host, ''), '|',
+                              IFNULL(cs_uri_stem, ''), '|',
+                              IFNULL(CAST(sc_status AS STRING), '0'), '|',
+                              -- User-Agentの正規化（大文字小文字を統一）
+                              IFNULL(LOWER(cs_user_agent), ''), '|',
+                              -- 追加の一意性確保のためのフィールド
+                              IFNULL(CAST(sc_bytes AS STRING), '0'), '|',
+                              IFNULL(CAST(time_taken AS STRING), '0')
+                            )
+                          ))
+                        ) AS _merge_key
+                      FROM staged_data
+                    ),
+                    -- 重複排除（同一キーの中で最も早い時刻のレコードを優先）
+                    deduped_data AS (
+                      SELECT * EXCEPT(_merge_key, rn)
+                      FROM (
+                        SELECT
+                          *,
+                          ROW_NUMBER() OVER (
+                            PARTITION BY _merge_key 
+                            ORDER BY 
+                              IFNULL(time, TIME '00:00:00'), 
+                              x_edge_request_id NULLS LAST
+                          ) AS rn
+                        FROM keyed_data
+                      )
+                      WHERE rn = 1
+                    )
+                    SELECT * FROM deduped_data
+                  ) AS source
+                  ON target.date = source.date 
+                    AND (
+                      -- x_edge_request_idが存在する場合はそれで照合
+                      (target.x_edge_request_id IS NOT NULL 
+                        AND source.x_edge_request_id IS NOT NULL 
+                        AND target.x_edge_request_id = source.x_edge_request_id)
+                      -- 存在しない場合は複合キーで照合
+                      OR (
+                        target.x_edge_request_id IS NULL 
+                        AND source.x_edge_request_id IS NULL
+                        AND target.date = source.date
+                        AND target.time = source.time
+                        AND target.c_ip = source.c_ip
+                        AND target.cs_uri_stem = source.cs_uri_stem
+                      )
+                    )
+                  -- 既存レコードの更新（基本的には更新しないが、念のため）
+                  WHEN MATCHED THEN
+                    UPDATE SET
+                      time = source.time,
+                      x_edge_location = source.x_edge_location,
+                      sc_bytes = source.sc_bytes,
+                      c_ip = source.c_ip,
+                      cs_method = source.cs_method,
+                      cs_host = source.cs_host,
+                      cs_uri_stem = source.cs_uri_stem,
+                      sc_status = source.sc_status,
+                      cs_referer = source.cs_referer,
+                      cs_user_agent = source.cs_user_agent,
+                      cs_uri_query = source.cs_uri_query,
+                      cs_cookie = source.cs_cookie,
+                      x_edge_result_type = source.x_edge_result_type,
+                      x_edge_request_id = source.x_edge_request_id,
+                      x_host_header = source.x_host_header,
+                      cs_protocol = source.cs_protocol,
+                      cs_bytes = source.cs_bytes,
+                      time_taken = source.time_taken,
+                      x_forwarded_for = source.x_forwarded_for,
+                      ssl_protocol = source.ssl_protocol,
+                      ssl_cipher = source.ssl_cipher,
+                      x_edge_response_result_type = source.x_edge_response_result_type,
+                      cs_protocol_version = source.cs_protocol_version,
+                      fle_status = source.fle_status,
+                      fle_encrypted_fields = source.fle_encrypted_fields,
+                      c_port = source.c_port,
+                      time_to_first_byte = source.time_to_first_byte,
+                      x_edge_detailed_result_type = source.x_edge_detailed_result_type,
+                      sc_content_type = source.sc_content_type,
+                      sc_content_len = source.sc_content_len,
+                      sc_range_start = source.sc_range_start,
+                      sc_range_end = source.sc_range_end
+                  -- 新規レコードの挿入
+                  WHEN NOT MATCHED THEN
+                    INSERT (
+                      date, time, x_edge_location, sc_bytes, c_ip, cs_method,
+                      cs_host, cs_uri_stem, sc_status, cs_referer, cs_user_agent,
+                      cs_uri_query, cs_cookie, x_edge_result_type, x_edge_request_id,
+                      x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for,
+                      ssl_protocol, ssl_cipher, x_edge_response_result_type,
+                      cs_protocol_version, fle_status, fle_encrypted_fields, c_port,
+                      time_to_first_byte, x_edge_detailed_result_type, sc_content_type,
+                      sc_content_len, sc_range_start, sc_range_end
+                    )
+                    VALUES (
+                      source.date, source.time, source.x_edge_location, source.sc_bytes,
+                      source.c_ip, source.cs_method, source.cs_host, source.cs_uri_stem,
+                      source.sc_status, source.cs_referer, source.cs_user_agent,
+                      source.cs_uri_query, source.cs_cookie, source.x_edge_result_type,
+                      source.x_edge_request_id, source.x_host_header, source.cs_protocol,
+                      source.cs_bytes, source.time_taken, source.x_forwarded_for,
+                      source.ssl_protocol, source.ssl_cipher, source.x_edge_response_result_type,
+                      source.cs_protocol_version, source.fle_status, source.fle_encrypted_fields,
+                      source.c_port, source.time_to_first_byte, source.x_edge_detailed_result_type,
+                      source.sc_content_type, source.sc_content_len, source.sc_range_start,
+                      source.sc_range_end
+                    );
         result: merge_job
 
     - wait_for_merge_job:

@@ -22,11 +22,54 @@ main:
           - dataflow_job_name: '$${"cf-logs-import-" + text.replace_all(processing_date, "-", "")}'
           - dataflow_sa: '$${"dam-dataflow-sa@" + project_id + ".iam.gserviceaccount.com"}'
 
+    # ===================== Staging クリーンアップ（重複防止） =====================
+    - cleanup_staging_before_import:
+        call: http.post
+        args:
+          url: '$${"https://bigquery.googleapis.com/bigquery/v2/projects/" + project_id + "/jobs"}'
+          auth:
+            type: OAuth2
+          body:
+            jobReference:
+              location: '$${region}'
+              jobId: '$${"pre_cleanup_staging_" + text.replace_all(processing_date, "-", "") + "_" + text.replace_all(text.substring(string(sys.now()), 11, 19), ":", "")}'
+            configuration:
+              query:
+                useLegacySql: false
+                priority: "INTERACTIVE"
+                parameterMode: "NAMED"
+                queryParameters:
+                  - name: proc_date
+                    parameterType: { type: "DATE" }
+                    parameterValue: { value: '$${processing_date}' }
+                query: |
+                  -- Dataflow実行前に対象日のデータをクリーンアップ（重複防止）
+                  DELETE FROM `${project_id}.${dataset_id}.cf_logs_staging`
+                  WHERE DATE(date) = @proc_date;
+              labels:
+                workflow: "dam-daily-pipeline"
+                step: "pre_cleanup_staging"
+                target_date: '$${text.replace_all(processing_date, "-", "")}'
+        result: pre_cleanup_job
+
+    - log_pre_cleanup_job:
+        call: sys.log
+        args:
+          severity: "INFO"
+          text: '$${"Pre-cleanup staging table for " + processing_date + " - Job ID: " + pre_cleanup_job.body.jobReference.jobId}'
+
+    - wait_for_pre_cleanup:
+        call: wait_for_bq_job
+        args:
+          project_id: '$${project_id}'
+          job_id: '$${pre_cleanup_job.body.jobReference.jobId}'
+          location: '$${pre_cleanup_job.body.jobReference.location}'
+
     # ===================== Dataflow 起動（リトライ） =====================
     - init_dataflow_retry:
         assign:
           - zones: ["a","b","c"]
-          - machine_types:  ["e2-medium","n1-standard-1","e2-small"]
+          - machine_types:  ["e2-medium","e2-standard-2","n1-standard-2"]
           - dataflow_job_id: ""
 
     - launch_dataflow_loop:
@@ -66,7 +109,7 @@ main:
                               JSONPath: "gs://dam-dataflow-temp/schemas/cf_logs_schema.json"
                             environment:
                               serviceAccountEmail: '$${dataflow_sa}'
-                              maxWorkers: 5
+                              maxWorkers: 10
                               numWorkers: 2
                               zone: '$${current_zone}'
                               tempLocation: '$${"gs://dam-dataflow-temp/temp/" + processing_date}'
@@ -129,7 +172,48 @@ main:
                         call: sys.log
                         args:
                           severity: "WARNING"
-                          text: '$${"Dataflow launch attempt " + string(retry_attempt + 1) + " failed"}'
+                          text: '$${"Dataflow launch attempt " + string(retry_attempt + 1) + " failed: " + string(e)}'
+                    
+                    # リトライ前にstagingをクリーンアップ（重複防止）
+                    - cleanup_before_retry:
+                        switch:
+                          - condition: '$${retry_attempt < 2}'
+                            steps:
+                              - log_cleanup:
+                                  call: sys.log
+                                  args:
+                                    severity: "INFO"
+                                    text: '$${"Cleaning up staging table before retry attempt " + string(retry_attempt + 2)}'
+                              - cleanup_staging_for_retry:
+                                  call: http.post
+                                  args:
+                                    url: '$${"https://bigquery.googleapis.com/bigquery/v2/projects/" + project_id + "/jobs"}'
+                                    auth:
+                                      type: OAuth2
+                                    body:
+                                      jobReference:
+                                        location: '$${region}'
+                                        jobId: '$${"retry_cleanup_" + text.replace_all(processing_date, "-", "") + "_" + string(retry_attempt) + "_" + text.replace_all(text.substring(string(sys.now()), 11, 19), ":", "")}'
+                                      configuration:
+                                        query:
+                                          useLegacySql: false
+                                          priority: "INTERACTIVE"
+                                          parameterMode: "NAMED"
+                                          queryParameters:
+                                            - name: proc_date
+                                              parameterType: { type: "DATE" }
+                                              parameterValue: { value: '$${processing_date}' }
+                                          query: |
+                                            DELETE FROM `${project_id}.${dataset_id}.cf_logs_staging`
+                                            WHERE DATE(date) = @proc_date;
+                                  result: retry_cleanup_job
+                              - wait_for_retry_cleanup:
+                                  call: wait_for_bq_job
+                                  args:
+                                    project_id: '$${project_id}'
+                                    job_id: '$${retry_cleanup_job.body.jobReference.jobId}'
+                                    location: '$${retry_cleanup_job.body.jobReference.location}'
+                    
                     - check_if_last_attempt:
                         switch:
                           - condition: '$${retry_attempt >= 2}'
@@ -162,14 +246,18 @@ main:
             raise:
               message: '$${"Dataflow job failed with status: " + job_status}'
 
-    # ===================== ステージング -> 本番（対象日だけ、重複排除） =====================
-    - merge_cf_logs_from_staging:
-        call: googleapis.bigquery.v2.jobs.insert
+    # ===================== ステージング -> 本番（パーティション上書き方式） =====================
+    # Step 1: 対象日のデータを削除
+    - delete_partition_data:
+        call: http.post
         args:
-          projectId: '$${project_id}'
+          url: '$${"https://bigquery.googleapis.com/bigquery/v2/projects/" + project_id + "/jobs"}'
+          auth:
+            type: OAuth2
           body:
             jobReference:
               location: '$${region}'
+              jobId: '$${"delete_partition_" + text.replace_all(processing_date, "-", "") + "_" + text.replace_all(text.substring(string(sys.now()), 11, 19), ":", "")}'
             configuration:
               query:
                 useLegacySql: false
@@ -180,153 +268,125 @@ main:
                     parameterType: { type: "DATE" }
                     parameterValue: { value: '$${processing_date}' }
                 query: |
-                  -- MERGE文で効率的にアップサート（パーティション指定付き）
-                  MERGE `${project_id}.${dataset_id}.cf_logs` AS target
-                  USING (
-                    -- ステージングデータから重複を排除
-                    WITH staged_data AS (
-                      SELECT *
-                      FROM `${project_id}.${dataset_id}.cf_logs_staging`
-                      WHERE DATE(date) = @proc_date
-                    ),
-                    -- 重複排除キー生成（改善版）
-                    keyed_data AS (
-                      SELECT
-                        *,
-                        -- x_edge_request_idを優先、なければ複合キーを生成
-                        COALESCE(
-                          x_edge_request_id,
-                          -- より安定したハッシュキー生成
-                          TO_HEX(SHA256(
-                            CONCAT(
-                              CAST(date AS STRING), '|',
-                              IFNULL(CAST(time AS STRING), '00:00:00'), '|',
-                              IFNULL(c_ip, ''), '|',
-                              IFNULL(cs_method, ''), '|',
-                              IFNULL(cs_host, ''), '|',
-                              IFNULL(cs_uri_stem, ''), '|',
-                              IFNULL(CAST(sc_status AS STRING), '0'), '|',
-                              -- User-Agentの正規化（大文字小文字を統一）
-                              IFNULL(LOWER(cs_user_agent), ''), '|',
-                              -- 追加の一意性確保のためのフィールド
-                              IFNULL(CAST(sc_bytes AS STRING), '0'), '|',
-                              IFNULL(CAST(time_taken AS STRING), '0')
-                            )
-                          ))
-                        ) AS _merge_key
-                      FROM staged_data
-                    ),
-                    -- 重複排除（同一キーの中で最も早い時刻のレコードを優先）
-                    deduped_data AS (
-                      SELECT * EXCEPT(_merge_key, rn)
-                      FROM (
-                        SELECT
-                          *,
-                          ROW_NUMBER() OVER (
-                            PARTITION BY _merge_key 
-                            ORDER BY 
-                              IFNULL(time, TIME '00:00:00'), 
-                              x_edge_request_id NULLS LAST
-                          ) AS rn
-                        FROM keyed_data
-                      )
-                      WHERE rn = 1
-                    )
-                    SELECT * FROM deduped_data
-                  ) AS source
-                  ON target.date = source.date 
-                    AND (
-                      -- x_edge_request_idが存在する場合はそれで照合
-                      (target.x_edge_request_id IS NOT NULL 
-                        AND source.x_edge_request_id IS NOT NULL 
-                        AND target.x_edge_request_id = source.x_edge_request_id)
-                      -- 存在しない場合は複合キーで照合
-                      OR (
-                        target.x_edge_request_id IS NULL 
-                        AND source.x_edge_request_id IS NULL
-                        AND target.date = source.date
-                        AND target.time = source.time
-                        AND target.c_ip = source.c_ip
-                        AND target.cs_uri_stem = source.cs_uri_stem
-                      )
-                    )
-                  -- 既存レコードの更新（基本的には更新しないが、念のため）
-                  WHEN MATCHED THEN
-                    UPDATE SET
-                      time = source.time,
-                      x_edge_location = source.x_edge_location,
-                      sc_bytes = source.sc_bytes,
-                      c_ip = source.c_ip,
-                      cs_method = source.cs_method,
-                      cs_host = source.cs_host,
-                      cs_uri_stem = source.cs_uri_stem,
-                      sc_status = source.sc_status,
-                      cs_referer = source.cs_referer,
-                      cs_user_agent = source.cs_user_agent,
-                      cs_uri_query = source.cs_uri_query,
-                      cs_cookie = source.cs_cookie,
-                      x_edge_result_type = source.x_edge_result_type,
-                      x_edge_request_id = source.x_edge_request_id,
-                      x_host_header = source.x_host_header,
-                      cs_protocol = source.cs_protocol,
-                      cs_bytes = source.cs_bytes,
-                      time_taken = source.time_taken,
-                      x_forwarded_for = source.x_forwarded_for,
-                      ssl_protocol = source.ssl_protocol,
-                      ssl_cipher = source.ssl_cipher,
-                      x_edge_response_result_type = source.x_edge_response_result_type,
-                      cs_protocol_version = source.cs_protocol_version,
-                      fle_status = source.fle_status,
-                      fle_encrypted_fields = source.fle_encrypted_fields,
-                      c_port = source.c_port,
-                      time_to_first_byte = source.time_to_first_byte,
-                      x_edge_detailed_result_type = source.x_edge_detailed_result_type,
-                      sc_content_type = source.sc_content_type,
-                      sc_content_len = source.sc_content_len,
-                      sc_range_start = source.sc_range_start,
-                      sc_range_end = source.sc_range_end
-                  -- 新規レコードの挿入
-                  WHEN NOT MATCHED THEN
-                    INSERT (
-                      date, time, x_edge_location, sc_bytes, c_ip, cs_method,
-                      cs_host, cs_uri_stem, sc_status, cs_referer, cs_user_agent,
-                      cs_uri_query, cs_cookie, x_edge_result_type, x_edge_request_id,
-                      x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for,
-                      ssl_protocol, ssl_cipher, x_edge_response_result_type,
-                      cs_protocol_version, fle_status, fle_encrypted_fields, c_port,
-                      time_to_first_byte, x_edge_detailed_result_type, sc_content_type,
-                      sc_content_len, sc_range_start, sc_range_end
-                    )
-                    VALUES (
-                      source.date, source.time, source.x_edge_location, source.sc_bytes,
-                      source.c_ip, source.cs_method, source.cs_host, source.cs_uri_stem,
-                      source.sc_status, source.cs_referer, source.cs_user_agent,
-                      source.cs_uri_query, source.cs_cookie, source.x_edge_result_type,
-                      source.x_edge_request_id, source.x_host_header, source.cs_protocol,
-                      source.cs_bytes, source.time_taken, source.x_forwarded_for,
-                      source.ssl_protocol, source.ssl_cipher, source.x_edge_response_result_type,
-                      source.cs_protocol_version, source.fle_status, source.fle_encrypted_fields,
-                      source.c_port, source.time_to_first_byte, source.x_edge_detailed_result_type,
-                      source.sc_content_type, source.sc_content_len, source.sc_range_start,
-                      source.sc_range_end
-                    );
-        result: merge_job
-
-    - wait_for_merge_job:
+                  -- 対象日のパーティションを削除
+                  DELETE FROM `${project_id}.${dataset_id}.cf_logs`
+                  WHERE date = @proc_date;
+              labels:
+                workflow: "dam-daily-pipeline"
+                step: "delete_partition"
+                target_date: '$${text.replace_all(processing_date, "-", "")}'
+        result: delete_job
+    
+    - log_delete_job:
+        call: sys.log
+        args:
+          severity: "INFO"
+          text: '$${"Delete partition for " + processing_date + " - Job ID: " + delete_job.body.jobReference.jobId}'
+    
+    - wait_for_delete_job:
         call: wait_for_bq_job
         args:
           project_id: '$${project_id}'
-          job_id: '$${merge_job.jobReference.jobId}'
-          location: '$${merge_job.jobReference.location}'
-
-    # ステージングの対象日だけクリーンアップ
-    - cleanup_staging_for_day:
-        call: googleapis.bigquery.v2.jobs.insert
+          job_id: '$${delete_job.body.jobReference.jobId}'
+          location: '$${delete_job.body.jobReference.location}'
+    
+    # Step 2: 重複排除して新規データを挿入
+    - insert_deduped_data:
+        call: http.post
         args:
-          projectId: '$${project_id}'
+          url: '$${"https://bigquery.googleapis.com/bigquery/v2/projects/" + project_id + "/jobs"}'
+          auth:
+            type: OAuth2
           body:
             jobReference:
               location: '$${region}'
+              jobId: '$${"insert_cf_logs_" + text.replace_all(processing_date, "-", "") + "_" + text.replace_all(text.substring(string(sys.now()), 11, 19), ":", "")}'
+            configuration:
+              query:
+                useLegacySql: false
+                priority: "INTERACTIVE"
+                parameterMode: "NAMED"
+                queryParameters:
+                  - name: proc_date
+                    parameterType: { type: "DATE" }
+                    parameterValue: { value: '$${processing_date}' }
+                query: |
+                  -- ステージングデータから重複を排除して挿入
+                  INSERT INTO `${project_id}.${dataset_id}.cf_logs`
+                  WITH staged_data AS (
+                    SELECT *
+                    FROM `${project_id}.${dataset_id}.cf_logs_staging`
+                    WHERE DATE(date) = @proc_date
+                  ),
+                  -- 重複排除キー生成（シンプル化）
+                  keyed_data AS (
+                    SELECT
+                      *,
+                      -- x_edge_request_idを優先、なければ複合キーを生成
+                      COALESCE(
+                        x_edge_request_id,
+                        TO_HEX(SHA256(
+                          CONCAT(
+                            CAST(date AS STRING), '|',
+                            IFNULL(CAST(time AS STRING), '00:00:00'), '|',
+                            IFNULL(c_ip, ''), '|',
+                            IFNULL(cs_method, ''), '|',
+                            IFNULL(cs_host, ''), '|',
+                            IFNULL(cs_uri_stem, ''), '|',
+                            IFNULL(CAST(sc_status AS STRING), '0'), '|',
+                            IFNULL(LOWER(cs_user_agent), ''), '|',
+                            IFNULL(CAST(sc_bytes AS STRING), '0'), '|',
+                            IFNULL(CAST(time_taken AS STRING), '0')
+                          )
+                        ))
+                      ) AS _merge_key
+                    FROM staged_data
+                  )
+                  -- 重複排除（同一キーの中で最も早い時刻のレコードを優先）
+                  SELECT * EXCEPT(_merge_key, rn)
+                  FROM (
+                    SELECT
+                      *,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY _merge_key 
+                        ORDER BY 
+                          IFNULL(time, TIME '00:00:00'), 
+                          x_edge_request_id NULLS LAST
+                      ) AS rn
+                    FROM keyed_data
+                  )
+                  WHERE rn = 1;
+              labels:
+                workflow: "dam-daily-pipeline"
+                step: "insert_cf_logs"
+                target_date: '$${text.replace_all(processing_date, "-", "")}'
+        result: insert_job
+
+    - log_insert_job_link:
+        call: sys.log
+        args:
+          severity: "INFO"
+          text: '$${"
+BigQuery INSERT job started: https://console.cloud.google.com/bigquery?project=" + project_id + "&j=" + region + ":" + insert_job.body.jobReference.jobId + "&page=queryresults"}'
+
+    - wait_for_insert_job:
+        call: wait_for_bq_job
+        args:
+          project_id: '$${project_id}'
+          job_id: '$${insert_job.body.jobReference.jobId}'
+          location: '$${insert_job.body.jobReference.location}'
+
+    # ステージングの対象日だけクリーンアップ（MERGE後の最終クリーンアップ）
+    - cleanup_staging_for_day:
+        call: http.post
+        args:
+          url: '$${"https://bigquery.googleapis.com/bigquery/v2/projects/" + project_id + "/jobs"}'
+          auth:
+            type: OAuth2
+          body:
+            jobReference:
+              location: '$${region}'
+              jobId: '$${"cleanup_staging_" + text.replace_all(processing_date, "-", "") + "_" + text.replace_all(text.substring(string(sys.now()), 11, 19), ":", "")}'
             configuration:
               query:
                 useLegacySql: false
@@ -339,14 +399,25 @@ main:
                 query: |
                   DELETE FROM `${project_id}.${dataset_id}.cf_logs_staging`
                   WHERE DATE(date) = @proc_date;
+              labels:
+                workflow: "dam-daily-pipeline"
+                step: "cleanup_staging"
+                target_date: '$${text.replace_all(processing_date, "-", "")}'
         result: cleanup_job
+
+    - log_cleanup_job_link:
+        call: sys.log
+        args:
+          severity: "INFO"
+          text: '$${"
+BigQuery cleanup job started: https://console.cloud.google.com/bigquery?project=" + project_id + "&j=" + region + ":" + cleanup_job.body.jobReference.jobId + "&page=queryresults"}'
 
     - wait_for_cleanup:
         call: wait_for_bq_job
         args:
           project_id: '$${project_id}'
-          job_id: '$${cleanup_job.jobReference.jobId}'
-          location: '$${cleanup_job.jobReference.location}'
+          job_id: '$${cleanup_job.body.jobReference.jobId}'
+          location: '$${cleanup_job.body.jobReference.location}'
 
     # ===================== Dataform実行 =====================
     - compile_dataform:
@@ -372,16 +443,16 @@ main:
             invocationConfig:
               includedTargets:
                 - database: '$${project_id}'
-                  schema: "dam_workflow_test"
+                  schema: '$${dataset_id}'
                   name: "ip_features"
                 - database: '$${project_id}'
-                  schema: "dam_workflow_test"
+                  schema: '$${dataset_id}'
                   name: "bot_ips"
                 - database: '$${project_id}'
-                  schema: "dam_workflow_test"
+                  schema: '$${dataset_id}'
                   name: "cf_logs_filtered"
                 - database: '$${project_id}'
-                  schema: "dam_workflow_test"
+                  schema: '$${dataset_id}'
                   name: "logs_enriched"
               transitiveDependenciesIncluded: true
               fullyRefreshIncrementalTablesEnabled: false
@@ -412,7 +483,7 @@ wait_for_job_completion:
   steps:
     - init_polling:
         assign:
-          - max_retries: 120
+          - max_retries: 240  # 4時間に延長（60秒 × 240 = 14400秒）
           - retry_count: 0
 
     - check_job:
@@ -434,6 +505,14 @@ wait_for_job_completion:
                     return: "JOB_STATE_CANCELLED"
                   - condition: '$${retry_count >= max_retries}'
                     return: "JOB_STATE_TIMEOUT"
+            - log_progress:
+                switch:
+                  - condition: '$${retry_count % 10 == 0 and retry_count > 0}'
+                    call: sys.log
+                    args:
+                      severity: "INFO"
+                      text: '$${"
+Dataflow job " + job_id + " still running. Waited " + string(retry_count) + " minutes..."}'
             - wait_and_retry:
                 call: sys.sleep
                 args: { seconds: 60 }
@@ -501,8 +580,10 @@ wait_for_bq_job:
   steps:
     - init:
         assign:
-          - max_retries: 60
+          - max_retries: 1080  # 3時間に延長（10秒 × 1080 = 10800秒 = 180分）
           - retry_count: 0
+          - start_time: '$${sys.now()}'
+          - sleep_seconds: 10
     - check_job:
         try:
           steps:
@@ -524,9 +605,24 @@ wait_for_bq_job:
                                 message: '$${job_result.status.errorResult.message}'
                       - return_success:
                           return: "SUCCESS"
+            - log_progress:
+                switch:
+                  - condition: '$${(retry_count * sleep_seconds) % 600 == 0 and retry_count > 0}'  # 10分ごと
+                    call: sys.log
+                    args:
+                      severity: "INFO"
+                      text: '$${"
+BigQuery job " + job_id + " still running. Elapsed: " + string(retry_count * sleep_seconds / 60) + " minutes"}'
+            # 長時間実行時は段階的にポーリング間隔を延長（最大30秒）
+            - adjust_polling_interval:
+                switch:
+                  - condition: '$${retry_count > 0 and (retry_count * sleep_seconds) % 1800 == 0 and sleep_seconds < 30}'  # 30分ごとに調整
+                    assign:
+                      - sleep_seconds: '$${sleep_seconds + 5}'  # 5秒ずつ増やす
             - wait_and_retry:
                 call: sys.sleep
-                args: { seconds: 10 }
+                args:
+                  seconds: '$${sleep_seconds}'
             - increment_retry:
                 assign:
                   - retry_count: '$${retry_count + 1}'
@@ -534,7 +630,8 @@ wait_for_bq_job:
                 switch:
                   - condition: '$${retry_count >= max_retries}'
                     raise:
-                      message: "BigQuery job timeout"
+                      message: '$${"
+BigQuery job timeout after 180 minutes. Job ID: " + job_id}'
                 next: check_job
         except:
           as: e
